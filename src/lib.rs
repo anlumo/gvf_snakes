@@ -1,7 +1,8 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
+use image::buffer::ConvertBuffer;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Luma, Pixel, Rgb};
 use imageproc::drawing::draw_polygon_mut;
-// use imageproc::drawing::{draw_polygon_mut, Polygon};
+use nalgebra::Vector2;
 use std::path::Path;
 
 fn read_image(file_path: &str) -> DynamicImage {
@@ -80,17 +81,18 @@ fn compute_gvf_field(
                     + gvf_x.get_pixel(x, y - 1)[0])
                     * mu;
 
-                let grad_v = (gvf_y.get_pixel(x + 1, y)[0] - 2.0 * v
-                    + gvf_y.get_pixel(x - 1, y)[0]
-                    + gvf_y.get_pixel(x, y + 1)[0]
+                let grad_v = (gvf_y.get_pixel(x, y + 1)[0] - 2.0 * v
+                    + gvf_y.get_pixel(x, y - 1)[0]
+                    + gvf_y.get_pixel(x + 1, y)[0]
                     - 2.0 * v
-                    + gvf_y.get_pixel(x, y - 1)[0])
+                    + gvf_y.get_pixel(x - 1, y)[0])
                     * mu;
 
                 let s = gradient_magnitude.get_pixel(x, y)[0];
+                let direction = gradient_direction.get_pixel(x, y)[0];
 
-                let new_u = u + grad_u - s * (u - gradient_direction.get_pixel(x, y)[0]);
-                let new_v = v + grad_v - s * (v - gradient_direction.get_pixel(x, y)[0]);
+                let new_u = u + grad_u - s * (u - s * direction.cos());
+                let new_v = v + grad_v - s * (v - s * direction.sin());
 
                 updated_gvf_x.put_pixel(x, y, Luma([new_u]));
                 updated_gvf_y.put_pixel(x, y, Luma([new_v]));
@@ -107,7 +109,7 @@ fn compute_gvf_field(
 use std::f32::consts::PI;
 
 type Point = imageproc::point::Point<f32>;
-type Snake = Vec<Point>;
+type Snake = Vec<Vector2<f32>>;
 
 fn initialize_snake(n_points: usize, center: Point, radius: f32) -> Snake {
     let Point {
@@ -120,7 +122,7 @@ fn initialize_snake(n_points: usize, center: Point, radius: f32) -> Snake {
         let angle = 2.0 * PI * (i as f32) / (n_points as f32);
         let x = center_x + radius * angle.cos();
         let y = center_y + radius * angle.sin();
-        snake.push(Point::new(x, y));
+        snake.push(Vector2::new(x, y));
     }
 
     snake
@@ -133,7 +135,7 @@ fn interpolate_gvf(gvf: &ImageBuffer<Luma<f32>, Vec<f32>>, x: f32, y: f32) -> f3
     let x_floor = x.floor() as u32;
     let y_floor = y.floor() as u32;
 
-    if x_floor + 1 >= width || y_floor + 1 >= height {
+    if x_floor == u32::MAX || y_floor == u32::MAX || x_floor + 1 >= width || y_floor + 1 >= height {
         return 0.0;
     }
 
@@ -163,12 +165,11 @@ fn update_snake(
     let n_points = snake.len();
     let mut new_snake = snake.clone();
 
-    for _ in 0..iterations {
+    for iteration in 0..iterations {
         for i in 0..n_points {
-            let Point { x, y } = snake[i];
-
-            let force_x = interpolate_gvf(gvf_x, x, y);
-            let force_y = interpolate_gvf(gvf_y, x, y);
+            let x = snake[i].x;
+            let y = snake[i].y;
+            println!("[{iteration}] snake pos: {x}, {y}");
 
             let prev_point = snake[(i + n_points - 1) % n_points];
             let next_point = snake[(i + 1) % n_points];
@@ -178,10 +179,24 @@ fn update_snake(
             let internal_force_y = alpha * (prev_point.y - 2.0 * y + next_point.y)
                 + beta * (prev_point.y - 4.0 * y + next_point.y);
 
-            let new_x = x + gamma * (force_x + internal_force_x);
-            let new_y = y + gamma * (force_y + internal_force_y);
+            let new_x = x + internal_force_x;
+            let new_y = y + internal_force_y;
 
-            new_snake[i] = Point::new(new_x, new_y);
+            new_snake[i] = Vector2::new(new_x, new_y);
+        }
+
+        for entry in &mut new_snake {
+            let x = entry.x;
+            let y = entry.y;
+
+            let force_x = interpolate_gvf(gvf_x, x, y);
+            let force_y = interpolate_gvf(gvf_y, x, y);
+            // println!("{x}, {y}: force_x = {force_x}, force_y = {force_y}");
+
+            let new_x = x + gamma * force_x;
+            let new_y = y + gamma * force_y;
+
+            *entry = Vector2::new(new_x, new_y);
         }
 
         *snake = new_snake.clone();
@@ -261,7 +276,7 @@ pub fn run_gvf_snakes(
     input_image_path: &str,
     output_image_path: &str,
     snake_points: usize,
-    center: Point,
+    center: (f32, f32),
     radius: f32,
     mu: f32,
     gvf_iterations: usize,
@@ -270,10 +285,42 @@ pub fn run_gvf_snakes(
     gamma: f32,
     snake_iterations: usize,
 ) {
+    let center = Point::new(center.0, center.1);
     let input_image = read_image(input_image_path);
     let (gradient_magnitude, gradient_direction) = gradient_magnitude_and_direction(&input_image);
-    let (gvf_x, gvf_y) =
-        compute_gvf_field(&gradient_magnitude, &gradient_direction, mu, gvf_iterations);
+
+    ConvertBuffer::<ImageBuffer<Luma<u8>, Vec<u8>>>::convert(&gradient_magnitude)
+        .save("gradient_magnitude.jpg")
+        .unwrap();
+    ConvertBuffer::<ImageBuffer<Rgb<u8>, Vec<u8>>>::convert(&gradient_direction)
+        .save("gradient_direction.jpg")
+        .unwrap();
+
+    let max_magnitude = gradient_magnitude.iter().cloned().fold(f32::MIN, f32::max);
+
+    // Create a new ImageBuffer to store the normalized gradient magnitudes
+    let (width, height) = gradient_magnitude.dimensions();
+    let mut normalized_gradient_magnitude = ImageBuffer::new(width, height);
+
+    // Iterate over the gradient magnitudes and normalize them
+    for (x, y, pixel) in gradient_magnitude.enumerate_pixels() {
+        let normalized_value = pixel[0] / max_magnitude;
+        normalized_gradient_magnitude.put_pixel(x, y, image::Luma([normalized_value]));
+    }
+
+    let (gvf_x, gvf_y) = compute_gvf_field(
+        &normalized_gradient_magnitude,
+        &gradient_direction,
+        mu,
+        gvf_iterations,
+    );
+
+    ConvertBuffer::<ImageBuffer<Luma<u8>, Vec<u8>>>::convert(&gvf_x)
+        .save("gvf_x.jpg")
+        .unwrap();
+    ConvertBuffer::<ImageBuffer<Luma<u8>, Vec<u8>>>::convert(&gvf_y)
+        .save("gvf_y.jpg")
+        .unwrap();
     let mut snake = initialize_snake(snake_points, center, radius);
     update_snake(
         &mut snake,
@@ -284,6 +331,8 @@ pub fn run_gvf_snakes(
         gamma,
         snake_iterations,
     );
+
+    println!("snake = {snake:?}");
 
     let mut output_image = input_image.to_rgb8();
     draw_snake_on_image(&mut output_image, &snake);
